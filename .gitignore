@@ -51,3 +51,7 @@ math*.png
 
 # ---- 数据集（体积较大，用脚本下载）----
 datasets/
+
+# ---- PDF 测试文件 ----
+/tmp/pdf_test/
+*.docx

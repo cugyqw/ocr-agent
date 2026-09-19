@@ -33,11 +33,19 @@
 │   ├── sequence.py      #   请求状态机
 │   ├── sampler.py       #   批量采样（greedy / top-k / top-p）
 │   └── config.py        #   配置项
+├── pdf_convert.py       # PDF 转 Markdown / Word 入口
+├── pdfmd/               # PDF 处理模块
+│   ├── converter.py     #   主控：自动判断类型并选择处理路径
+│   ├── detector.py      #   类型检测（电子版 vs 扫描版）
+│   ├── md_builder.py    #   Markdown 构建
+│   ├── docx_builder.py  #   Word 构建
+│   └── image_utils.py   #   图片预处理（裁剪留白）
 ├── docs/                # 测试报告
 │   ├── baseline_report.md    # 基线实测报告
-│   └── baseline_general.json # 原始测试数据
+│   └── eval_report.md        # CMMLU 评测报告
 ├── bench_miinfer.py     # 引擎性能基准
 ├── bench_baseline.py    # 解题能力基线测试
+├── bench_clean.py       # CMMLU 数据集评测
 └── run.py               # 最简参考脚本
 ```
 
@@ -53,6 +61,16 @@
 ```bash
 pip install torch transformers accelerate pillow torchvision modelscope \
     -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# PDF 转换功能额外需要
+pip install pdfplumber python-docx \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+PDF 功能还需要系统级的 `pdftoppm`（poppler-utils 提供）：
+
+```bash
+sudo apt-get install -y poppler-utils
 ```
 
 > 注意：若 `triton` 报 `Python.h: No such file or directory`，需安装
@@ -159,6 +177,75 @@ python bench_miinfer.py
    带 padding 的 batch 仍会算出错误结果。
    因此引擎采用**等长分桶**策略：仅合并 `total_len` 相同的序列。
    这与 vLLM 用 PagedAttention 任意拼装序列不同——后者需要模型侧配合。
+
+## PDF 转 Markdown / Word
+
+自动判断 PDF 类型并选择处理路径：
+
+```
+PDF
+ ├── 电子版 → pdfplumber 直接提取（快、准、零成本）
+ ├── 扫描版 → pdftoppm 转图 → GLM-OCR
+ └── 混合版 → 逐页判断
+```
+
+### 用法
+
+```bash
+# 单个/多个 PDF
+python pdf_convert.py 报告.pdf
+python pdf_convert.py a.pdf b.pdf -o ./output
+
+# 批量处理目录
+python pdf_convert.py ./pdfs/ -o ./output
+
+# 只检测类型，不转换
+python pdf_convert.py 报告.pdf --detect
+
+# 只输出 Markdown
+python pdf_convert.py 报告.pdf --no-docx
+
+# 限制页数（大文档先试几页）
+python pdf_convert.py 扫描件.pdf --max-pages 5
+```
+
+### 实测性能
+
+| 类型 | 页数 | 耗时 | 说明 |
+|---|---|---|---|
+| 电子版 | 2 | **0.08s** | 直接提取，无需 OCR |
+| 扫描版 | 1 | 1.3s | 含渲染 + OCR |
+| 扫描版 | 2 | 5.7s | 含渲染 + OCR |
+
+### 两个关键实现细节
+
+**1. 渲染 DPI 必须控制在 150**
+
+GLM-OCR 的图片 token 数约等于像素数 / 1000，上限 4096：
+
+```
+200 DPI -> A4 = 1654x2339 = 3.87MP -> 4968 token  ❌ 超限，静默失败
+150 DPI -> A4 = 1240x1754 = 2.17MP -> 2784 token  ✅ 可用
+```
+
+用 200 DPI 时引擎会拒绝该请求，且**原本是静默失败**（返回空字符串无报错），
+现已改为抛出明确异常。
+
+**2. 必须裁剪页面留白**
+
+扫描件渲染后常有大片空白（实测文字只占画面 4%），
+会让 OCR 注意力稀释、识别不全。裁剪后同一页从"只识别出 1 行"
+变为"4 行全对"，且耗时从 6.5s 降到 4.6s。
+
+### 公式识别结果需要过滤
+
+对没有公式的页面硬跑 `Formula Recognition:`，模型有两种错误行为：
+
+1. 输出几百行空的 `$$` 标记
+2. 把普通文本强行包进 `$$` / `\mathrm{}`（"伪公式"）
+
+`_is_meaningful_formula()` 通过检查数学特征（运算符、LaTeX 数学命令、
+矩阵结构）来过滤，单元测试 9/9 通过。
 
 ## 已知局限
 

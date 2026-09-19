@@ -27,9 +27,19 @@ class OCRStage:
         self,
         model_path: str = "/home/yqw/桌面/ocr_agent/GLM-OCR",
         max_new_tokens: int = 1024,
+        max_model_len: int = 4096,
     ):
+        """
+        Args:
+            max_model_len: 单条序列最大长度（prompt + 生成）。
+                GLM-OCR 的图片 token 数约等于像素数/1000：
+                    单张图片(A4, 150DPI) 约 2800 token
+                    PDF 整页扫描件可能更大
+                PDF 场景建议调到 8192。
+        """
         self.model_path = model_path
         self.max_new_tokens = max_new_tokens
+        self.max_model_len = max_model_len
         self.engine: MiniInferEngine | None = None
 
     def load(self) -> None:
@@ -38,10 +48,10 @@ class OCRStage:
             model_path=self.model_path,
             max_batch_size=2,       # OCR 阶段并发需求低，省显存
             max_new_tokens=self.max_new_tokens,
-            max_model_len=4096,
+            max_model_len=self.max_model_len,
         ))
         self.engine.load_model()
-        logger.info("OCR 阶段就绪")
+        logger.info("OCR 阶段就绪（max_model_len=%d）", self.max_model_len)
 
     def run(self, image, prompt: str = PROMPT_TEXT) -> str:
         """识别一张图片。
@@ -64,9 +74,22 @@ class OCRStage:
             ],
         }]
         seq = self.engine.build_sequence(messages)
-        self.engine.add_request(seq)
+        ok = self.engine.add_request(seq)
         self.engine.run_until_done()
-        return self.engine.decode(seq).strip()
+
+        # 注意：入队失败或序列被中途拒绝时，output 为空。
+        # 之前这里直接返回空串，导致调用方完全看不出失败原因，
+        # 排查起来很费劲。这里改为抛出异常并说明原因。
+        if not ok:
+            raise RuntimeError(f"请求入队失败（队列已满）: {image}")
+
+        text = self.engine.decode(seq)
+        if not text.strip():
+            raise RuntimeError(
+                f"OCR 未产出内容（seq_id={seq.seq_id}, "
+                f"prompt_len={seq.prompt_len}, 图片可能过大导致 token 超限）: {image}"
+            )
+        return text.strip()
 
     def run_multi(self, image, prompts: list[str]) -> dict[str, str]:
         """用多个 prompt 识别同一张图，结果合并。
