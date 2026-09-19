@@ -5,6 +5,7 @@
 #   bash download_models.sh              # 下载全部
 #   bash download_models.sh ocr          # 只下 GLM-OCR
 #   bash download_models.sh math         # 只下 Qwen2.5-Math
+#   bash download_models.sh general      # 只下 Qwen2.5 通用版
 
 set -euo pipefail
 
@@ -42,13 +43,24 @@ download_math() {
     echo "完成: ./Qwen2.5-Math-1.5B-Instruct"
 }
 
+download_general() {
+    echo "=============================================="
+    echo "下载 Qwen2.5-1.5B-Instruct（约 2.9GB）"
+    echo "=============================================="
+    "$PYTHON" -m modelscope download \
+        --model Qwen/Qwen2.5-1.5B-Instruct \
+        --local_dir ./Qwen2.5-1.5B-Instruct
+    echo "完成: ./Qwen2.5-1.5B-Instruct"
+}
+
 case "$TARGET" in
-    ocr)  download_ocr ;;
-    math) download_math ;;
-    all)  download_ocr; download_math ;;
+    ocr)     download_ocr ;;
+    math)    download_math ;;
+    general) download_general ;;
+    all)     download_ocr; download_math; download_general ;;
     *)
         echo "未知参数: $TARGET"
-        echo "用法: bash download_models.sh [all|ocr|math]"
+        echo "用法: bash download_models.sh [all|ocr|math|general]"
         exit 1
         ;;
 esac

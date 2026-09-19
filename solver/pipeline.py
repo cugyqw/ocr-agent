@@ -1,12 +1,13 @@
-"""拍照解题流水线：图片 → OCR → 解题。
+"""拍照解题流水线：图片 → OCR → 科目识别 → 解题。
 
-两个模型都常驻显存，全程只加载一次。
-
-显存预算（RTX 5060 Ti 8GB）：
-    GLM-OCR (0.9B, bf16)      ~2.1 GB
-    Qwen2.5-Math (1.5B, bf16) ~3.1 GB
-    合计                      ~5.2 GB
-    加上 CUDA 上下文与 KV Cache，峰值约 6~7 GB
+架构：
+    GLM-OCR 常驻显存（识图）
+        ↓
+    科目识别（规则判断，零成本）
+        ↓
+    解题模型按需加载：
+        数学  → Qwen2.5-Math-1.5B
+        其他  → Qwen2.5-1.5B-Instruct
 """
 
 from __future__ import annotations
@@ -14,12 +15,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import torch
 
 from .ocr_stage import OCRStage, PROMPT_FORMULA, PROMPT_TEXT, clean_ocr_text
 from .solve_stage import SolveStage
+from .subject import describe, detect_subject
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class SolveResult:
     image: str
     ocr_text: str = ""
     ocr_formula: str = ""
+    subject: str = "general"
     answer: str = ""
     timings: dict = field(default_factory=dict)
 
@@ -44,36 +46,48 @@ class SolveResult:
             parts.append(f"\n[公式识别结果]\n{self.ocr_formula}")
         return "\n".join(parts).strip()
 
+    @property
+    def subject_name(self) -> str:
+        """科目中文名。"""
+        return describe(self.subject)
+
 
 class MathSolverPipeline:
-    """拍照解题流水线。"""
+    """拍照解题流水线（兼容旧名，现已支持多科目）。"""
 
     def __init__(
         self,
         ocr_model_path: str = "/home/yqw/桌面/ocr_agent/GLM-OCR",
-        solve_model_path: str = "/home/yqw/桌面/ocr_agent/Qwen2.5-Math-1.5B-Instruct",
+        math_model_path: str = "/home/yqw/桌面/ocr_agent/Qwen2.5-Math-1.5B-Instruct",
+        general_model_path: str = "/home/yqw/桌面/ocr_agent/Qwen2.5-1.5B-Instruct",
         use_formula_prompt: bool = True,
+        force_subject: str | None = None,
     ):
+        """
+        Args:
+            use_formula_prompt: 是否额外跑公式识别 prompt
+            force_subject: 强制指定科目（跳过自动识别），便于调试
+        """
         self.ocr = OCRStage(model_path=ocr_model_path)
-        self.solver = SolveStage(model_path=solve_model_path)
-        # 数学题建议同时跑 Text 和 Formula 两个 prompt，避免漏掉公式
+        self.solver = SolveStage(
+            math_model_path=math_model_path,
+            general_model_path=general_model_path,
+        )
         self.use_formula_prompt = use_formula_prompt
+        self.force_subject = force_subject
 
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
     def load(self) -> None:
-        """加载两个模型（各一次，常驻显存）。"""
+        """加载 OCR 模型（解题模型按需加载）。"""
         t0 = time.time()
         self.ocr.load()
         self.solver.load()
-        logger.info("流水线就绪，总共耗时 %.1fs", time.time() - t0)
-        if torch.cuda.is_available():
-            logger.info("显存占用: %.1f GB",
-                        torch.cuda.memory_allocated() / 1024**3)
+        logger.info("流水线就绪，耗时 %.1fs", time.time() - t0)
 
     def unload(self) -> None:
-        """释放两个模型。"""
+        """释放所有模型。"""
         self.ocr.unload()
         self.solver.unload()
 
@@ -86,16 +100,7 @@ class MathSolverPipeline:
         extra_instruction: str = "",
         history: list[dict] | None = None,
     ) -> SolveResult:
-        """对一张图片完成"识别 + 解题"。
-
-        Args:
-            image: 图片路径或 URL
-            extra_instruction: 附加给解题模型的额外要求
-            history: 多轮对话历史（用于追问）
-
-        Returns:
-            SolveResult
-        """
+        """对一张图片完成"识别 + 解题"。"""
         image = str(image)
         result = SolveResult(image=image)
 
@@ -109,17 +114,26 @@ class MathSolverPipeline:
             result.ocr_formula = clean_ocr_text(self.ocr.run(image, PROMPT_FORMULA))
             result.timings["ocr_formula"] = time.time() - t0
 
+        # ---- 科目识别 ----
+        t0 = time.time()
+        if self.force_subject:
+            result.subject = self.force_subject
+        else:
+            result.subject = detect_subject(result.problem)
+        result.timings["subject"] = time.time() - t0
+        logger.info("科目识别: %s", result.subject_name)
+
         # ---- 阶段二：解题 ----
         problem = result.problem
         if extra_instruction:
             problem = f"{problem}\n\n{extra_instruction}"
 
-        if not problem:
+        if not problem.strip():
             result.answer = "[OCR 未识别出内容，请检查图片是否清晰]"
             return result
 
         t0 = time.time()
-        result.answer = self.solver.run(problem, history=history)
+        result.answer = self.solver.run(problem, subject=result.subject, history=history)
         result.timings["solve"] = time.time() - t0
 
         result.timings["total"] = sum(
@@ -128,11 +142,7 @@ class MathSolverPipeline:
         return result
 
     def solve_many(self, images: list, extra_instruction: str = "") -> list[SolveResult]:
-        """批量解题。
-
-        说明：OCR 阶段会批处理（利用连续批处理），
-        解题阶段目前逐条（生成 token 多，批量收益受等长约束）。
-        """
+        """批量解题。OCR 阶段批处理，解题阶段按科目逐个处理。"""
         images = [str(i) for i in images]
         results = [SolveResult(image=img) for img in images]
 
@@ -150,17 +160,20 @@ class MathSolverPipeline:
 
         for r in results:
             r.timings["ocr_batch"] = ocr_time / max(len(images), 1)
+            r.subject = self.force_subject or detect_subject(r.problem)
 
-        # 解题逐条
-        for r in results:
+        # 解题：按科目分组，同科目的连续处理可减少模型切换
+        order = sorted(range(len(results)), key=lambda i: results[i].subject)
+        for i in order:
+            r = results[i]
             problem = r.problem
             if extra_instruction:
                 problem = f"{problem}\n\n{extra_instruction}"
-            if not problem:
+            if not problem.strip():
                 r.answer = "[OCR 未识别出内容]"
                 continue
             t0 = time.time()
-            r.answer = self.solver.run(problem)
+            r.answer = self.solver.run(problem, subject=r.subject)
             r.timings["solve"] = time.time() - t0
 
         return results
