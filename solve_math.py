@@ -29,7 +29,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-from solver import MathSolverPipeline, describe
+from solver import MathSolverPipeline
 
 
 def main():

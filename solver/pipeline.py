@@ -16,7 +16,6 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-import torch
 
 from .ocr_stage import OCRStage, PROMPT_FORMULA, PROMPT_TEXT, clean_ocr_text
 from .solve_stage import SolveStage

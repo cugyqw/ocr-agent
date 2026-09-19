@@ -3,7 +3,7 @@
 设计原则：所有可调参数集中在这里，便于后续按需扩展。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 

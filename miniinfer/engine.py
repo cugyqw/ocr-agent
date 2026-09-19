@@ -27,7 +27,7 @@ from .config import EngineConfig
 from .kv_cache import BatchKVCache
 from .sampler import Sampler
 from .scheduler import Scheduler
-from .sequence import Sequence, SeqStatus
+from .sequence import Sequence
 
 logger = logging.getLogger(__name__)
 
