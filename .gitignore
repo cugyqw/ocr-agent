@@ -48,3 +48,6 @@ Thumbs.db
 /tmp_*
 test_*.png
 math*.png
+
+# ---- 数据集（体积较大，用脚本下载）----
+datasets/
