@@ -72,6 +72,7 @@ class MiniInferEngine:
             "forward_calls": 0,
             "tokens_generated": 0,
             "prefill_batches": 0,
+            "prefix_cache_hits": 0,   # 前缀缓存命中次数
         }
 
     # ------------------------------------------------------------------
@@ -259,7 +260,33 @@ class MiniInferEngine:
 
         先把各序列的 prompt 拼成 batch 前向，再把 batch cache 拆回各自槽位，
         这样后续 decode 阶段每步只需处理 1 个 token，且能按长度分桶批量执行。
+
+        前缀缓存：批量前先筛掉能命中缓存的序列。命中的直接恢复 KV、
+        跳过 prefill；剩下的才真正走批量计算。
+        注意批量命中率天然有限——同一批请求同时调度时，缓存里还没有
+        它们自己的条目。真正受益的是"先后到达"的重复请求。
         """
+        # ---- 先摘出能命中前缀缓存的序列 ----
+        if self.config.enable_prefix_cache:
+            rest = []
+            for seq in group:
+                if seq.pixel_values is not None:
+                    rest.append(seq)
+                    continue
+                try:
+                    if self.kv_manager.try_restore_prefix(seq.slot, seq.input_ids):
+                        self.stats["prefix_cache_hits"] += 1
+                        seq.cache_offset = len(seq.input_ids)
+                        self._decode_one_by_one([seq])
+                        continue
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("前缀缓存恢复失败，回退 prefill: %s", e)
+                    self.kv_manager.reset_slot(seq.slot)
+                rest.append(seq)
+            group = rest
+            if not group:
+                return
+
         batch = len(group)
         device = self.device
         L = group[0].prompt_len
@@ -308,6 +335,13 @@ class MiniInferEngine:
                 v_i = layer.values[i : i + 1].contiguous()
                 slot_cache.update(k_i, v_i, layer_idx)
 
+            # 写入前缀缓存（纯文本序列）。此处槽位里正是完整 prompt 的 KV。
+            if seq.pixel_values is None and self.config.enable_prefix_cache:
+                try:
+                    self.kv_manager.save_prefix(seq.slot, seq.input_ids)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("前缀缓存写入失败（忽略）: %s", e)
+
         logits = out.logits[:, -1, :]
         for i, seq in enumerate(group):
             if seq.is_finished:
@@ -316,7 +350,26 @@ class MiniInferEngine:
             self._handle_new_token(seq, token)
 
     def _prefill_single(self, seq: Sequence) -> None:
-        """单条序列的 prefill（作为兜底与长尾处理）。"""
+        """单条序列的 prefill（作为兜底与长尾处理）。
+
+        对接前缀缓存：若该 prompt 的 KV 已缓存，则跳过整个 prefill，
+        直接把缓存恢复到槽位，再走一步 decode 产出首个 token。
+        """
+        # ---- 前缀缓存命中检查 ----
+        # 注意：只有纯文本序列才走前缀缓存。多模态序列的 KV 依赖图片特征，
+        # 不同图片的 prompt token 可能相同但视觉内容不同，复用会导致错误。
+        if seq.pixel_values is None and self.config.enable_prefix_cache:
+            try:
+                if self.kv_manager.try_restore_prefix(seq.slot, seq.input_ids):
+                    self.stats["prefix_cache_hits"] += 1
+                    seq.cache_offset = len(seq.input_ids)
+                    # 缓存里已有完整 prompt 的 KV，直接进入 decode
+                    self._decode_one_by_one([seq])
+                    return
+            except Exception as e:  # noqa: BLE001
+                logger.warning("前缀缓存恢复失败，回退正常 prefill: %s", e)
+                self.kv_manager.reset_slot(seq.slot)
+
         inputs = {
             "input_ids": torch.tensor([seq.input_ids], device=self.device),
             "attention_mask": torch.ones(
@@ -342,6 +395,16 @@ class MiniInferEngine:
             return
 
         self.stats["forward_calls"] += 1
+
+        # ---- 写入前缀缓存 ----
+        # 此时槽位里存的正是完整 prompt 的 KV，可被后续同 prompt 请求复用。
+        # 图片序列不缓存（见上）。
+        if seq.pixel_values is None and self.config.enable_prefix_cache:
+            try:
+                self.kv_manager.save_prefix(seq.slot, seq.input_ids)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("前缀缓存写入失败（忽略）: %s", e)
+
         token = self._sample_one(seq, out.logits[:, -1, :])
         self._handle_new_token(seq, token)
 
@@ -518,6 +581,33 @@ class MiniInferEngine:
         return self.processor.decode(seq.output_ids, skip_special_tokens=True)
 
     # ------------------------------------------------------------------
+    # 统计
+    # ------------------------------------------------------------------
+    def full_stats(self) -> Dict[str, float]:
+        """汇总引擎全部统计指标。
+
+        包含：
+          steps             调度步数
+          forward_calls     模型前向次数
+          tokens_generated  生成的 token 总数
+          prefill_batches   prefill 批次数
+          prefix_cache_hits 前缀缓存命中次数
+          total_scheduled   累计调度过的序列数
+          cache_entries     前缀缓存当前条目数
+          cache_hit_rate    前缀缓存命中率
+        """
+        cache = self.kv_manager.prefix_cache if self.kv_manager else None
+        total_lookups = (cache.hits + cache.misses) if cache else 0
+
+        stats = dict(self.stats)
+        stats["total_scheduled"] = self.scheduler.total_scheduled
+        stats["cache_entries"] = len(cache) if cache else 0
+        stats["cache_hit_rate"] = (
+            cache.hits / total_lookups if total_lookups else 0.0
+        )
+        return stats
+
+    # ------------------------------------------------------------------
     # 资源
     # ------------------------------------------------------------------
     def memory_usage(self) -> Dict[str, float]:
@@ -528,6 +618,7 @@ class MiniInferEngine:
             result["reserved_mb"] = torch.cuda.memory_reserved() / 1024 / 1024
         if self.kv_manager is not None:
             result["kv_cache_mb"] = self.kv_manager.memory_usage_mb()
+            result["prefix_cache_mb"] = self.kv_manager.prefix_cache.memory_usage_mb()
         return result
 
     def shutdown(self) -> None:

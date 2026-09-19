@@ -90,17 +90,6 @@ class OCRStage:
             )
         return text.strip()
 
-    def run_multi(self, image, prompts: list[str]) -> dict[str, str]:
-        """用多个 prompt 识别同一张图，结果合并。
-
-        数学题里文字和公式是混排的，用单一 prompt 可能漏内容，
-        所以分别跑 Text / Formula，再把结果拼起来。
-        """
-        results = {}
-        for p in prompts:
-            results[p] = self.run(image, p)
-        return results
-
     def run_batch(self, images: list, prompt: str = PROMPT_TEXT) -> list[str]:
         """批量识别多张图（利用引擎的连续批处理）。"""
         if self.engine is None:

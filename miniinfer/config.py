@@ -4,7 +4,6 @@
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -33,19 +32,12 @@ class EngineConfig:
     # ---- 调度 ----
     # 队列最大等待请求数，超过则拒绝
     max_queue_size: int = 128
-    # 调度策略: "fcfs"（先来先服务）
-    schedule_policy: str = "fcfs"
 
     # ---- 采样 ----
     do_sample: bool = False
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
-
-    # ---- 视觉输入 ----
-    # 图片最长边像素上限。原模型默认 9633792，太大，限制后显著省显存。
-    # 设为 None 表示不限制。
-    max_image_pixels: Optional[int] = 1280 * 1280
 
     # ---- 性能 ----
     # 是否使用 torch.inference_mode（关闭梯度，省显存）

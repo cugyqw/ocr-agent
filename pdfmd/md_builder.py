@@ -18,10 +18,10 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+from .text_rules import is_meaningful_formula, looks_like_heading
+
 logger = logging.getLogger(__name__)
 
-# 中文字体判断：含较多 CJK 字符的行更可能是标题
-_CJK_RANGE = ("\u4e00", "\u9fff")
 
 
 def render_pdf_pages(
@@ -130,99 +130,6 @@ def ocr_pages(
     return results
 
 
-def _is_meaningful_formula(text: str) -> bool:
-    """判断公式识别结果是否有效。
-
-    背景：对没有公式的页面硬跑 "Formula Recognition:"，模型有两种
-    错误行为，都必须过滤：
-
-    1. 输出一堆空的 $$ 标记（实测能刷出几百行）
-    2. 把普通文本强行包进 $$ 里，例如把"会议纪要/时间/地点"整段
-       套上 \\mathrm{} 和 $$，这不是公式，是模型在"完成任务的表演"
-
-    判断标准：去掉标记后，内容里必须有真正的数学特征
-    （运算符、LaTeX 数学命令），否则判为无效。
-    """
-    if not text:
-        return False
-
-    # 去掉 $$ 与环境标记
-    cleaned = re.sub(r"\$\$|\\begin\{[^}]*\}|\\end\{[^}]*\}", "", text)
-    cleaned = re.sub(r"[\s\[\]{}]", "", cleaned)
-
-    if len(cleaned) < 4:
-        return False
-
-    # LaTeX 数学命令（注意排除 \mathrm \text \begin \end \left \right
-    # 这类"排版壳"，它们常被用来包装普通文本）
-    n_latex_math = len(re.findall(
-        r"\\(frac|sqrt|sum|int|lim|alpha|beta|gamma|theta|pi|times|cdot|"
-        r"div|pm|mp|leq|geq|neq|approx|infty|partial|nabla|log|ln|sin|cos|tan)",
-        text,
-    ))
-
-    # 数学运算符与数字（数字单独出现不算，需配合运算符）
-    n_math_chars = len(re.findall(r"[+\-*/=^_<>]", cleaned))
-    n_digits = len(re.findall(r"[0-9]", cleaned))
-
-    if n_latex_math >= 1:
-        return True
-    if n_math_chars >= 1 and n_digits >= 1:
-        return True
-    if n_math_chars >= 3:
-        return True
-    # 表格/矩阵结构：array/matrix 环境且有列分隔符与换行符
-    if re.search(r"\\begin\{(array|matrix|pmatrix|bmatrix|cases)", text) \
-            and "&" in text and "\\\\" in text:
-        return True
-
-    return False
-
-
-def _contains_math(s: str) -> bool:
-    """判断一行是否包含数学公式。
-
-    背景：公式行往往"短、无标点"，会被标题启发式误判。
-    实测 "S = pi * r^2" 就被错当成标题了。
-    """
-    # 等号、运算符密集
-    if s.count("=") >= 1 and len(s) < 60:
-        # 排除"答案是 X"这类正常句子
-        if re.search(r"[+\-*/^_\\]|sqrt|frac|sum|int|pi\b|log|sin|cos|tan", s):
-            return True
-    # LaTeX 命令
-    if re.search(r"\\[a-zA-Z]+", s):
-        return True
-    # 纯符号/数字构成的短行
-    if len(s) <= 30 and re.fullmatch(r"[\s0-9a-zA-Z+\-*/=^_(){}\[\].,<>]+", s) \
-            and re.search(r"[+\-*/=^]", s):
-        return True
-    return False
-
-
-def _looks_like_heading(line: str) -> bool:
-    """粗略判断一行是否像标题。
-
-    规则：短、不含句末标点、行首常见标题特征。
-    这是启发式判断，不追求完美——真正的版面分析需要模型。
-    """
-    s = line.strip()
-    if not s or len(s) > 40:
-        return False
-    # 以句号/逗号结尾的多半是正文
-    if s[-1] in "。，；：、,.;:":
-        return False
-    # 公式行不是标题
-    if _contains_math(s):
-        return False
-    # 常见标题模式
-    if re.match(r"^(第[一二三四五六七八九十百\d]+[章节讲部分课]|[\d]+[\.、]\s*\S)", s):
-        return True
-    # 纯短行且无标点
-    if len(s) <= 20 and not any(c in s for c in "。，；：、,.;:！？!?"):
-        return True
-    return False
-
 
 def pages_to_markdown(pages: list[dict], source: str = "", ocr_mode: bool = False) -> str:
     """把页面内容拼成 Markdown。
@@ -248,7 +155,7 @@ def pages_to_markdown(pages: list[dict], source: str = "", ocr_mode: bool = Fals
                 if not line.strip():
                     lines.append("")
                     continue
-                if not ocr_mode and _looks_like_heading(line):
+                if not ocr_mode and looks_like_heading(line):
                     lines.append(f"## {line.strip()}")
                 else:
                     lines.append(line)
@@ -256,7 +163,7 @@ def pages_to_markdown(pages: list[dict], source: str = "", ocr_mode: bool = Fals
 
         # 公式（OCR 模式）。无效结果（一堆空 $$）直接丢弃。
         formula = (p.get("formula") or "").strip()
-        if formula and _is_meaningful_formula(formula):
+        if formula and is_meaningful_formula(formula):
             lines.append("### 公式")
             lines.append("")
             lines.append(formula)

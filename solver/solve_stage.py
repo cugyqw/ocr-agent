@@ -130,15 +130,12 @@ class SolveStage:
                 torch.cuda.empty_cache()
 
     def load(self) -> None:
-        """预加载。默认不预热任何模型，等首次请求时按需加载。
+        """就绪检查。不预热模型，等首次请求时按科目按需加载。
 
-        保留此方法是为了与旧接口兼容；如需预热可调用 preload()。
+        之所以不预热：显存有限，而一次请求只会用到其中一个模型，
+        预热反而会占着不需要的那份显存。
         """
         logger.info("解题阶段就绪（模型将按科目按需加载）")
-
-    def preload(self, kind: str = "math") -> None:
-        """预加载指定模型。"""
-        self._load(kind)
 
     def unload(self) -> None:
         """释放全部模型。"""
@@ -200,11 +197,3 @@ class SolveStage:
 
         new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
         return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-    # ------------------------------------------------------------------
-    # 状态
-    # ------------------------------------------------------------------
-    @property
-    def loaded_models(self) -> list[str]:
-        """当前已加载的模型列表。"""
-        return list(self._loaded)

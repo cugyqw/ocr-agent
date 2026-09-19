@@ -35,7 +35,8 @@ class Scheduler:
         self.waiting: Deque[Sequence] = deque()
         self.running: List[Optional[Sequence]] = [None] * config.max_batch_size
 
-        # 统计
+        # 统计：累计被调度过的序列数（只增不减），
+        # 由 engine 汇总进 stats 对外暴露
         self.total_scheduled = 0
 
     # ------------------------------------------------------------------
@@ -111,18 +112,6 @@ class Scheduler:
         """是否还有未完成的工作。"""
         return bool(self.waiting) or any(s is not None for s in self.running)
 
-    def num_running(self) -> int:
-        """当前运行中的序列数。"""
-        return sum(1 for s in self.running if s is not None)
-
-    def num_waiting(self) -> int:
-        """当前等待中的序列数。"""
-        return len(self.waiting)
-
-    def free_slot_count(self) -> int:
-        """空闲槽位数。"""
-        return sum(1 for s in self.running if s is None)
-
     # ------------------------------------------------------------------
     # 取消
     # ------------------------------------------------------------------
@@ -141,12 +130,3 @@ class Scheduler:
                 seq.mark_aborted()
                 return True
         return False
-
-    def clear_finished(self) -> List[Sequence]:
-        """清空并返回所有已完成的序列（用于统计/回收）。"""
-        done = []
-        for i, seq in enumerate(self.running):
-            if seq is not None and seq.is_finished:
-                done.append(seq)
-                self.running[i] = None
-        return done

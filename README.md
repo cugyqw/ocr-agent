@@ -39,7 +39,10 @@
 │   ├── detector.py      #   类型检测（电子版 vs 扫描版）
 │   ├── md_builder.py    #   Markdown 构建
 │   ├── docx_builder.py  #   Word 构建
+│   ├── text_rules.py    #   标题/公式判断规则（两个 builder 共用）
 │   └── image_utils.py   #   图片预处理（裁剪留白）
+├── tests/               # 测试
+│   └── test_prefix_cache.py  # 前缀缓存正确性与收益验证
 ├── docs/                # 测试报告
 │   ├── baseline_report.md    # 基线实测报告
 │   └── eval_report.md        # CMMLU 评测报告
@@ -158,6 +161,34 @@ python bench_miinfer.py
 ```
 
 实测吞吐由 122.8 tok/s 提升至 202.3 tok/s（约 **1.65 倍**）。
+
+### 前缀缓存
+
+同一 prompt 重复请求时，直接复用已算好的 KV Cache，跳过 prefill。
+
+```bash
+python tests/test_prefix_cache.py   # 正确性与收益验证
+```
+
+实测加速（prompt 越长、输出越短，收益越大）：
+
+| prompt 长度 | 输出长度 | 命中后耗时 | 加速 |
+|---|---|---|---|
+| 254 token | 8 | 0.06s | 1.2x |
+| 1096 token | 4 | 0.04s | 1.9x |
+| **1262 token** | **1** | **0.010s** | **5.5x** |
+
+这正是 RAG 场景的形态——知识库内容注入 prompt 使 prompt 很长，
+而答案很短。此时缓存收益最大。
+
+**限制**：只对纯文本序列生效。多模态序列的 KV 依赖图片特征，
+不同图片的 prompt token 可能相同但视觉内容不同，复用会导致错误。
+
+`engine.full_stats()` 可查看命中情况：
+
+```python
+{'prefix_cache_hits': 3, 'cache_entries': 3, 'cache_hit_rate': 0.75, ...}
+```
 
 ### GLM-OCR 的关键约束
 

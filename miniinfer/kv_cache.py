@@ -33,7 +33,20 @@ def hash_tokens(token_ids: List[int]) -> str:
 
 
 class PrefixCache:
-    """前缀缓存：按 prompt 前缀哈希缓存 KV Cache。
+    """前缀缓存：按 token 序列哈希缓存 KV Cache。
+
+    对应 vLLM 的 Prefix Caching / SGLang 的 RadixAttention：
+    多条请求若共享相同的前缀，其 KV Cache 可以复用，跳过重复的 prefill。
+
+    适用场景：批量处理同一模板的文档时，prompt 前缀（如系统提示、
+    固定指令）完全相同，命中率很高。
+
+    实现说明：
+        缓存的是"完整序列的 KV"（而非任意长度前缀）。这样实现简单、
+        语义清晰，代价是只有序列完全一致才命中。对 OCR/批量处理场景
+        已经足够——它们的 prompt 模板高度统一。
+
+        缓存粒度按"层"存储：DynamicCache 是多层结构，逐层保存。
 
     线程安全性：单进程单线程假设，引擎的 step 循环里串行访问。
     """
@@ -41,33 +54,61 @@ class PrefixCache:
     def __init__(self, config: EngineConfig):
         self.config = config
         self.enabled = config.enable_prefix_cache
-        # 有序字典实现 LRU
-        self._store: "OrderedDict[str, Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+        # 有序字典实现 LRU：key -> list[(k, v)]（按层）
+        self._store: "OrderedDict[str, List[Tuple[torch.Tensor, torch.Tensor]]]" = \
+            OrderedDict()
+        # 统计
+        self.hits = 0
+        self.misses = 0
 
-    def get(self, token_ids: List[int]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    def get(self, token_ids: List[int]) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
         """查询前缀缓存。
 
+        Args:
+            token_ids: 序列的 token id 列表（作为缓存键）
+
         Returns:
-            (key_cache, value_cache) 命中时返回，未命中返回 None。
+            命中时返回按层组织的 [(k, v), ...]，未命中返回 None。
+            k/v 形状为 [1, heads, seq, dim]（单序列，无 batch 维扩展）。
         """
         if not self.enabled:
             return None
         key = hash_tokens(token_ids)
         if key not in self._store:
+            self.misses += 1
             return None
         # 命中则移到末尾（LRU）
         self._store.move_to_end(key)
+        self.hits += 1
         return self._store[key]
 
-    def put(self, token_ids: List[int], k: torch.Tensor, v: torch.Tensor) -> None:
-        """写入前缀缓存。k/v 应为 [num_layers, batch, heads, seq, dim] 之类，
-        这里按层拆分后逐层存储更省内存，简化起见先存整块。"""
-        if not self.enabled:
+    def put(self, token_ids: List[int], cache) -> None:
+        """写入前缀缓存。
+
+        Args:
+            token_ids: 序列的 token id 列表（作为缓存键）
+            cache: DynamicCache 对象，取其各层的 keys/values
+        """
+        if not self.enabled or cache is None:
             return
+
+        layers: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for layer in getattr(cache, "layers", []):
+            if layer is None or layer.keys is None:
+                continue
+            # 分离计算图并复制，避免拖住显存
+            layers.append((
+                layer.keys.detach().clone(),
+                layer.values.detach().clone(),
+            ))
+
+        if not layers:
+            return
+
         key = hash_tokens(token_ids)
-        # 分离计算图，避免拖住显存
-        self._store[key] = (k.detach().clone(), v.detach().clone())
+        self._store[key] = layers
         self._store.move_to_end(key)
+
         # LRU 淘汰
         while len(self._store) > self.config.prefix_cache_size:
             self._store.popitem(last=False)
@@ -75,6 +116,17 @@ class PrefixCache:
     def clear(self) -> None:
         """清空前缀缓存。"""
         self._store.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def memory_usage_mb(self) -> float:
+        """统计缓存占用的显存（MB）。"""
+        total = 0
+        for layers in self._store.values():
+            for k, v in layers:
+                total += k.numel() * k.element_size()
+                total += v.numel() * v.element_size()
+        return total / 1024 / 1024
 
     def __len__(self) -> int:
         return len(self._store)
@@ -118,6 +170,47 @@ class BatchKVCache:
     def get_slot(self, slot: int) -> Optional[DynamicCache]:
         """取某个槽位的 cache 对象。"""
         return self._caches[slot] if 0 <= slot < len(self._caches) else None
+
+    # ------------------------------------------------------------------
+    # 前缀缓存对接
+    # ------------------------------------------------------------------
+    def try_restore_prefix(
+        self, slot: int, token_ids: List[int]
+    ) -> bool:
+        """尝试从前缀缓存恢复某个槽位的 KV Cache。
+
+        命中时直接把缓存的 KV 写入该槽位，调用方即可跳过 prefill
+        （只需处理最后 1 个 token 来产出第一个输出）。
+
+        Args:
+            slot: 目标槽位
+            token_ids: 该序列的 token id 列表（作缓存键）
+
+        Returns:
+            True 表示命中并已恢复；False 表示未命中，需正常 prefill。
+        """
+        cached = self.prefix_cache.get(token_ids)
+        if cached is None:
+            return False
+
+        # 按层恢复。缓存里存的是单序列 KV（batch 维为 1），
+        # 与槽位一一对应，直接写入即可。
+        cache = DynamicCache()
+        for layer_idx, (k, v) in enumerate(cached):
+            cache.update(k, v, layer_idx)
+        self._caches[slot] = cache
+        return True
+
+    def save_prefix(self, slot: int, token_ids: List[int]) -> None:
+        """把某个槽位当前的 KV Cache 存入前缀缓存。
+
+        通常在 prefill 完成后调用——此时该槽位保存的正是完整 prompt
+        的 KV，后续请求若 prompt 相同即可直接复用。
+        """
+        cache = self.get_slot(slot)
+        if cache is None:
+            return
+        self.prefix_cache.put(token_ids, cache)
 
     def ensure_slot(self, slot: int) -> DynamicCache:
         """确保槽位已分配 cache。"""

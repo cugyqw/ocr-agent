@@ -20,6 +20,8 @@ import logging
 import re
 from pathlib import Path
 
+from .text_rules import is_meaningful_formula, looks_like_heading
+
 logger = logging.getLogger(__name__)
 
 
@@ -99,7 +101,7 @@ def pages_to_docx(
                 if not line.strip():
                     continue
 
-                if not ocr_mode and _looks_like_heading(line):
+                if not ocr_mode and looks_like_heading(line):
                     doc.add_heading(line.strip(), level=1)
                 else:
                     par = doc.add_paragraph()
@@ -107,7 +109,7 @@ def pages_to_docx(
 
         # 公式。无效结果（一堆空 $$）直接丢弃。
         formula = sanitize(p.get("formula") or "").strip()
-        if formula and _is_meaningful_formula(formula):
+        if formula and is_meaningful_formula(formula):
             doc.add_heading("公式", level=2)
             for fl in formula.split("\n"):
                 fl = sanitize(fl).strip()
@@ -126,70 +128,6 @@ def pages_to_docx(
     logger.info("已保存: %s", out_path)
     return out_path
 
-
-def _is_meaningful_formula(text: str) -> bool:
-    """判断公式识别结果是否有效（与 md_builder 保持一致的逻辑）。
-
-    过滤两类噪声：
-    1. 无公式页面输出的大量空 $$ 标记
-    2. 把普通文本强行包进 $$ / \\mathrm{} 的"伪公式"
-    """
-    if not text:
-        return False
-    cleaned = re.sub(r"\$\$|\\begin\{[^}]*\}|\\end\{[^}]*\}", "", text)
-    cleaned = re.sub(r"[\s\[\]{}]", "", cleaned)
-    if len(cleaned) < 4:
-        return False
-
-    n_latex_math = len(re.findall(
-        r"\\(frac|sqrt|sum|int|lim|alpha|beta|gamma|theta|pi|times|cdot|"
-        r"div|pm|mp|leq|geq|neq|approx|infty|partial|nabla|log|ln|sin|cos|tan)",
-        text,
-    ))
-    n_math_chars = len(re.findall(r"[+\-*/=^_<>]", cleaned))
-    n_digits = len(re.findall(r"[0-9]", cleaned))
-
-    if n_latex_math >= 1:
-        return True
-    if n_math_chars >= 1 and n_digits >= 1:
-        return True
-    if n_math_chars >= 3:
-        return True
-    # 表格/矩阵结构
-    if re.search(r"\\begin\{(array|matrix|pmatrix|bmatrix|cases)", text) \
-            and "&" in text and "\\\\" in text:
-        return True
-    return False
-
-
-def _contains_math(s: str) -> bool:
-    """判断一行是否包含数学公式（与 md_builder 保持一致）。"""
-    if s.count("=") >= 1 and len(s) < 60:
-        if re.search(r"[+\-*/^_\\]|sqrt|frac|sum|int|pi\b|log|sin|cos|tan", s):
-            return True
-    if re.search(r"\\[a-zA-Z]+", s):
-        return True
-    if len(s) <= 30 and re.fullmatch(r"[\s0-9a-zA-Z+\-*/=^_(){}\[\].,<>]+", s) \
-            and re.search(r"[+\-*/=^]", s):
-        return True
-    return False
-
-
-def _looks_like_heading(line: str) -> bool:
-    """与 md_builder 保持一致的标题启发式判断。"""
-    s = line.strip()
-    if not s or len(s) > 40:
-        return False
-    if s[-1] in "。，；：、,.;:":
-        return False
-    # 公式行不是标题
-    if _contains_math(s):
-        return False
-    if re.match(r"^(第[一二三四五六七八九十百\d]+[章节讲部分课]|[\d]+[\.、]\s*\S)", s):
-        return True
-    if len(s) <= 20 and not any(c in s for c in "。，；：、,.;:！？!?"):
-        return True
-    return False
 
 
 def _add_runs_with_emphasis(par, text: str) -> None:
